@@ -45,7 +45,7 @@ class SimConfig:
     qty_max: int = 6
 
     # Time/cost model
-    speed: float = 1.0  # distance units per time unit
+    speed: float = 1.0  # distance units per time unit (used to derive edge travel_time)
     fixed_service_time: float = 0.25
     cost_per_distance: float = 1.0
     stockout_penalty: float = 50.0
@@ -66,6 +66,8 @@ class OrderLogRow:
     vehicle_id: Optional[str]
     travel_distance: float
     travel_time: float
+    path_vehicle_to_wh: Optional[str]
+    path_wh_to_customer: Optional[str]
     delay: Optional[float]
     stockout: int
     cost: float
@@ -90,6 +92,7 @@ class SupplyChainSimulator:
             extra_edge_prob=cfg.extra_edge_prob,
             min_dist=cfg.min_edge_dist,
             max_dist=cfg.max_edge_dist,
+            speed=cfg.speed,
         )
 
         warehouse_nodes = self.network.nodes_of_kind("warehouse")
@@ -99,6 +102,8 @@ class SupplyChainSimulator:
             Warehouse(warehouse_id=f"W{i}", node_id=warehouse_nodes[i], inventory=cfg.initial_inventory)
             for i in range(len(warehouse_nodes))
         ]
+        for wh in self.warehouses:
+            self.network.set_inventory(wh.node_id, wh.inventory)
 
         # Vehicles start at random warehouse nodes (deterministic under seed)
         # Using a simple mapping rather than RNG to avoid cross-module coupling.
@@ -134,13 +139,15 @@ class SupplyChainSimulator:
     def travel_time(self, distance: float) -> float:
         return float(distance / self.cfg.speed) if self.cfg.speed > 0 else float("inf")
 
-    def _choose_greedy_assignment(self, order: Order) -> tuple[Optional[Warehouse], Optional[Vehicle], float, float, float]:
+    def _choose_greedy_assignment(
+        self, order: Order
+    ) -> tuple[Optional[Warehouse], Optional[Vehicle], float, float, float, Optional[list[str]], Optional[list[str]], float]:
         """
         Greedy baseline:
         - choose (warehouse, vehicle) minimizing total travel time:
             vehicle->warehouse + warehouse->customer
         - subject to warehouse having enough inventory and vehicle capacity >= order qty
-        Returns (warehouse, vehicle, dist_to_pickup, dist_to_dropoff, total_distance)
+        Returns (warehouse, vehicle, dist_to_pickup, dist_to_dropoff, total_distance, path_v_to_wh, path_wh_to_cust, total_travel_time)
         """
         best = None
         for wh in self.warehouses:
@@ -149,21 +156,26 @@ class SupplyChainSimulator:
             for v in self.vehicles:
                 if v.capacity < order.quantity:
                     continue
-                d1 = self.network.shortest_distance(v.node_id, wh.node_id)
-                d2 = self.network.shortest_distance(wh.node_id, order.customer_node)
+                path1 = self.network.shortest_time_path(v.node_id, wh.node_id)
+                path2 = self.network.shortest_time_path(wh.node_id, order.customer_node)
+                d1 = self.network.total_path_distance(path1)
+                d2 = self.network.total_path_distance(path2)
+                t1 = self.network.total_path_travel_time(path1)
+                t2 = self.network.total_path_travel_time(path2)
                 total_d = d1 + d2
-                total_t = self.travel_time(total_d)
-                cand = (total_t, total_d, wh, v, d1, d2)
+                total_t = t1 + t2
+                cand = (total_t, total_d, wh, v, d1, d2, path1, path2)
                 if best is None or cand[0] < best[0]:
                     best = cand
         if best is None:
-            return None, None, 0.0, 0.0, 0.0
-        _, _, wh, v, d1, d2 = best
-        return wh, v, d1, d2, d1 + d2
+            return None, None, 0.0, 0.0, 0.0, None, None, 0.0
+        total_t, _, wh, v, d1, d2, path1, path2 = best
+        return wh, v, d1, d2, d1 + d2, path1, path2, float(total_t)
 
     def on_order(self, order: Order) -> None:
         self.n_orders += 1
-        wh, v, d_pick, d_drop, total_d = self._choose_greedy_assignment(order)
+        self.network.add_demand(order.customer_node, order.quantity)
+        wh, v, d_pick, d_drop, total_d, path1, path2, travel_t = self._choose_greedy_assignment(order)
 
         if wh is None or v is None:
             # Stockout: nothing can fulfill right now (inventory constraint dominates in Phase 1)
@@ -182,6 +194,8 @@ class SupplyChainSimulator:
                     vehicle_id=None,
                     travel_distance=0.0,
                     travel_time=0.0,
+                    path_vehicle_to_wh=None,
+                    path_wh_to_customer=None,
                     delay=None,
                     stockout=1,
                     cost=cost,
@@ -191,6 +205,7 @@ class SupplyChainSimulator:
 
         # Allocate inventory immediately (reservation) to keep Phase 1 simple/deterministic.
         allocated = wh.allocate(order.quantity)
+        self.network.set_inventory(wh.node_id, wh.inventory)
         if not allocated:
             # Rare due to check in _choose_greedy_assignment, but keep safe.
             cost = float(self.cfg.stockout_penalty)
@@ -208,6 +223,8 @@ class SupplyChainSimulator:
                     vehicle_id=None,
                     travel_distance=0.0,
                     travel_time=0.0,
+                    path_vehicle_to_wh=None,
+                    path_wh_to_customer=None,
                     delay=None,
                     stockout=1,
                     cost=cost,
@@ -215,9 +232,11 @@ class SupplyChainSimulator:
             )
             return
 
-        t_pick = self.travel_time(d_pick)
-        t_drop = self.travel_time(d_drop)
-        t_total = t_pick + t_drop + float(self.cfg.fixed_service_time)
+        # Route-based travel time (derived from edge travel_time)
+        # Fallback to distance/speed if paths aren't available for any reason.
+        t_total = float(travel_t) + float(self.cfg.fixed_service_time)
+        if t_total <= 0:
+            t_total = self.travel_time(total_d) + float(self.cfg.fixed_service_time)
         cost = float(total_d * self.cfg.cost_per_distance)
 
         self.total_distance += float(total_d)
@@ -232,8 +251,10 @@ class SupplyChainSimulator:
                 d_total=total_d,
                 t_total=t_total,
                 cost=cost,
-                t_pick=t_pick,
-                t_drop=t_drop,
+                t_pick=float(self.network.shortest_travel_time(v.node_id, wh.node_id)),
+                t_drop=float(self.network.shortest_travel_time(wh.node_id, order.customer_node)),
+                path1=path1,
+                path2=path2,
             )
         )
 
@@ -248,6 +269,8 @@ class SupplyChainSimulator:
         cost: float,
         t_pick: float,
         t_drop: float,
+        path1: Optional[list[str]],
+        path2: Optional[list[str]],
     ):
         start_time = float(self.env.now)
         yield v.deliver(
@@ -259,6 +282,7 @@ class SupplyChainSimulator:
         )
         delivered_time = float(self.env.now)
         delay = delivered_time - order.created_time
+        self.network.serve_demand(order.customer_node, order.quantity)
         self.order_logs.append(
             OrderLogRow(
                 order_id=order.order_id,
@@ -271,6 +295,8 @@ class SupplyChainSimulator:
                 vehicle_id=v.vehicle_id,
                 travel_distance=float(d_total),
                 travel_time=float(t_total),
+                path_vehicle_to_wh="->".join(path1) if path1 else None,
+                path_wh_to_customer="->".join(path2) if path2 else None,
                 delay=float(delay),
                 stockout=0,
                 cost=float(cost),
